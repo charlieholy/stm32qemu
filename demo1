@@ -1,0 +1,115 @@
+main.c
+//////////
+  #include <stdint.h>
+
+// STM32F103 寄存器地址定义
+#define RCC_APB2ENR    (*(volatile uint32_t*)0x40021018)  // APB2 时钟使能寄存器
+#define GPIOA_CRL      (*(volatile uint32_t*)0x40010800)  // GPIOA 配置寄存器低
+#define GPIOA_ODR      (*(volatile uint32_t*)0x4001080C)  // GPIOA 输出数据寄存器
+
+// 延时函数（软件延时）
+static void delay(uint32_t count) {
+    while (count--);
+}
+
+int main(void) {
+    // 1. 使能 GPIOA 时钟（APB2 总线，GPIOA 对应位 2）
+    RCC_APB2ENR |= (1 << 2);
+
+    // 2. 配置 PA5 为推挽输出（GPIOA_CRL 的 20~23 位）
+    GPIOA_CRL &= ~(0xF << 20);  // 清除原有配置
+    GPIOA_CRL |=  (0x3 << 20);  // 推挽输出，速度 50MHz
+
+    // 3. 循环翻转 PA5 电平（LED 闪烁）
+    while (1) {
+        GPIOA_ODR ^= (1 << 5);  // 翻转 PA5 引脚电平
+        delay(1000000);         // 延时（调整数值改变闪烁频率）
+    }
+}
+
+// 复位处理函数（QEMU 需要，否则程序无法启动）
+void Reset_Handler(void) {
+    main();
+}
+
+// 中断向量表（仅保留复位入口，简化版）
+__attribute__((section(".isr_vector")))
+void (*const g_pfnVectors[])(void) = {
+    (void*)0x20005000,  // 栈顶地址（STM32F103 20KB RAM，栈顶设为 0x20005000）
+    Reset_Handler       // 复位中断处理函数
+};
+///////////
+stm32f103.ld
+/////////////
+  /* STM32F103 极简链接脚本 - 无语法错误 */
+MEMORY
+{
+    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 64K
+    RAM (rwx)  : ORIGIN = 0x20000000, LENGTH = 20K
+}
+
+SECTIONS
+{
+    /* 中断向量表 - 必须放在FLASH最开始 */
+    .isr_vector : { *(.isr_vectåor) } > FLASH
+
+    /* 代码段 */
+    .text : { *(.text) } > FLASH
+
+    /* 已初始化数据段 */
+    .data : { *(.data) } > RAM AT>FLASH
+
+    /* 未初始化数据段 */
+    .bss : { *(.bss) } > RAM
+}
+//////////////
+Makefile
+# 工具链配置
+CROSS_COMPILE = arm-none-eabi-
+CC      = $(CROSS_COMPILE)gcc
+LD      = $(CROSS_COMPILE)ld
+OBJCOPY = $(CROSS_COMPILE)objcopy
+QEMU    = qemu-system-arm
+
+# 编译参数：指定 Cortex-M3 内核，Thumb 指令集
+CFLAGS  = -mcpu=cortex-m3 -mthumb -Wall -O0 -g
+LDFLAGS = -T stm32f103.ld
+
+# 目标文件
+TARGET = stm32f103_led
+OBJS   = main.o
+
+# 默认目标：编译+生成二进制文件
+all: $(TARGET).elf $(TARGET).bin
+
+# 编译：生成 ELF 文件
+$(TARGET).elf: $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $^
+
+# 生成二进制文件（可选，用于真实硬件烧录）
+$(TARGET).bin: $(TARGET).elf
+	$(OBJCOPY) -O binary $< $@
+
+# 编译 .c 文件为 .o 文件
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# 运行：在 QEMU 中启动
+run: $(TARGET).elf
+	$(QEMU) -M stm32-p103 -kernel $< -nographic
+
+debug: $(TARGET).elf
+# 后台启动 QEMU 调试服务端
+	/opt/stm32/qemu_stm32/output/bin/qemu-system-arm -M stm32-p103 -kernel stm32f103_led.elf -nographic -S -s &
+# 启动 GDB 客户端并连接
+	arm-none-eabi-gdb $<
+
+# 清理编译产物
+clean:
+	rm -f *.o *.elf *.bin
+/////////////////////////////
+
+target remote:1234
+  b main
+  r
+  watch
