@@ -1,0 +1,210 @@
+#include <stdint.h>
+
+// ==================== 外设寄存器定义（STM32F103）====================
+#define RCC_APB2ENR    (*(volatile uint32_t*)0x40021018)
+#define RCC_APB1ENR    (*(volatile uint32_t*)0x4002101C)
+#define GPIOA_CRL      (*(volatile uint32_t*)0x40010800)
+#define GPIOA_ODR      (*(volatile uint32_t*)0x4001080C)
+#define USART2_SR      (*(volatile uint32_t*)0x40004400)
+#define USART2_DR      (*(volatile uint32_t*)0x40004404)
+#define USART2_BRR     (*(volatile uint32_t*)0x40004408)
+#define USART2_CR1     (*(volatile uint32_t*)0x4000440C)
+
+// ==================== 内核寄存器定义（Cortex-M3）====================
+#define NVIC_INT_CTRL   (*(volatile uint32_t*)0xE000ED04)  // 中断控制寄存器
+#define PENDSVSET_BIT   (1 << 28)                          // PendSV 触发位
+#define NVIC_SYSPRI2    (*(volatile uint32_t*)0xE000ED20)  // 系统优先级寄存器2
+#define PENDSV_PRIORITY 0xFF                                // PendSV 最低优先级
+
+// ==================== 多任务配置宏 ====================
+#define TASK_NUM        2                                   // 任务数量
+#define TASK_STACK_SIZE 1024                                // 每个任务栈大小（字节）
+
+// ==================== 任务控制块（TCB）====================
+typedef struct {
+    uint32_t* stack_ptr;  // 任务栈指针
+} TCB;
+
+// ==================== 全局变量 ====================
+uint8_t task_stack[TASK_NUM][TASK_STACK_SIZE] __attribute__((aligned(8))); // 任务栈空间
+TCB tcb[TASK_NUM];                                                         // 任务控制块数组
+uint32_t current_task = 0;                                                 // 当前运行任务ID
+
+// ==================== 函数前置声明 ====================
+void task1(void);
+void task2(void);
+void task_stack_init(uint32_t task_id, void (*task_func)(void));
+void task_switch_trigger(void);
+void __attribute__((naked)) PendSV_Handler(void);
+void usart2_init(void);
+void usart2_puts(const char* str);
+void delay(uint32_t count);
+void Reset_Handler(void);
+
+// ==================== 纯汇编实现 PendSV 中断服务函数（GNU 汇编语法）====================
+void __attribute__((naked)) PendSV_Handler(void)
+{
+    __asm__ volatile (
+        // GNU 汇编用 .extern 声明外部符号（替代 ARM 汇编的 IMPORT）
+        ".extern current_task     \n"
+        ".extern tcb              \n"
+        ".equ TASK_NUM, %c0       \n"    // 导入宏定义，%c0 表示常量展开
+        // 1. 保存当前任务上下文 R4-R11
+        "push {r4-r11}            \n"
+        // 2. 保存当前 SP 到 TCB
+        "ldr r0, =current_task    \n"    // r0 = &current_task
+        "ldr r1, [r0]             \n"    // r1 = current_task
+        "ldr r2, =tcb             \n"    // r2 = &tcb
+        "str sp, [r2, r1, lsl #2] \n"    // tcb[r1].stack_ptr = sp (TCB元素4字节)
+        // 3. 切换到下一个任务
+        "add r1, r1, #1           \n"    // r1++
+        "cmp r1, %c0              \n"    // 比较 r1 和 TASK_NUM
+        "bne L_TASK_OK            \n"    // 未越界则跳转
+        "mov r1, #0               \n"    // 越界重置为0
+        "L_TASK_OK:               \n"
+        "str r1, [r0]             \n"    // 更新 current_task = r1
+        // 4. 恢复下一个任务的 SP
+        "ldr sp, [r2, r1, lsl #2] \n"    // sp = tcb[r1].stack_ptr
+        // 5. 恢复上下文 R4-R11
+        "pop {r4-r11}             \n"
+        // 6. 异常返回
+        "bx lr                    \n"
+        : : "i"(TASK_NUM)               // 传入宏 TASK_NUM 作为立即数
+    );
+}
+
+// ==================== 串口初始化（USART2 PA2/PA3）====================
+void usart2_init(void) {
+    RCC_APB2ENR |= (1 << 2);   // GPIOA 时钟使能
+    RCC_APB1ENR |= (1 << 17);  // USART2 时钟使能
+
+    GPIOA_CRL &= ~(0xFF << 8); // 清空 PA2/PA3 配置
+    GPIOA_CRL |= (0x0B << 8);  // PA2: 复用推挽输出 50MHz
+    GPIOA_CRL |= (0x04 << 12); // PA3: 浮空输入
+
+    USART2_BRR = 0x1388;       // 72MHz 时钟下 115200 波特率
+    USART2_CR1 |= (1 << 13);   // USART 使能
+    USART2_CR1 |= (1 << 3);    // TX 使能
+}
+
+// ==================== 串口字符串发送（原子操作）====================
+void usart2_puts(const char* str) {
+    __asm volatile("cpsid i"); // 关闭全局中断，防止打印被打断
+    while (*str) {
+        while (!(USART2_SR & (1 << 7))); // 等待发送缓冲区空
+        USART2_DR = *str++;              // 发送一个字符
+    }
+    __asm volatile("cpsie i"); // 开启全局中断
+}
+
+// ==================== 简单延时函数 ====================
+void delay(uint32_t count) {
+    while (count--);
+}
+
+// ==================== 任务栈初始化（构造完整异常栈帧）====================
+void task_stack_init(uint32_t task_id, void (*task_func)(void)) {
+    uint32_t stack_top = (uint32_t)(task_stack[task_id] + TASK_STACK_SIZE);
+    stack_top &= ~0x7; // 强制 8 字节对齐（Cortex-M3 硬性要求）
+    uint32_t* stack = (uint32_t*)stack_top;
+
+    // ---------- 手动构造硬件异常栈帧（8个寄存器） ----------
+    *(--stack) = 0x01000000; // xPSR: Thumb 模式必须置位 bit24
+    *(--stack) = (uint32_t)task_func; // PC: 任务入口函数地址
+    *(--stack) = 0xFFFFFFFE; // LR: 异常返回码（线程模式+MSP+开启中断）
+    *(--stack) = 0x00000000; // R12
+    *(--stack) = 0x00000000; // R3
+    *(--stack) = 0x00000000; // R2
+    *(--stack) = 0x00000000; // R1
+    *(--stack) = 0x00000000; // R0
+
+    // ---------- 构造软件上下文帧（R4-R11） ----------
+    for (int i = 0; i < 8; i++) {
+        *(--stack) = 0x00000000; // R4-R11 初始化为 0
+    }
+
+    // ---------- 保存栈顶指针到 TCB ----------
+    tcb[task_id].stack_ptr = stack;
+}
+
+// ==================== 触发 PendSV 异常（任务切换入口）====================
+void task_switch_trigger(void) {
+    NVIC_INT_CTRL |= PENDSVSET_BIT;
+}
+
+// ==================== 任务1：LED 闪烁 + 串口打印 ====================
+void task1(void) {
+    while (1) {
+        GPIOA_ODR ^= (1 << 5);   // 翻转 PA5 LED
+        usart2_puts("Task1: LED Blink\r\n");
+        delay(500000);
+        task_switch_trigger();   // 主动触发任务切换
+    }
+}
+
+// ==================== 任务2：计数 + 串口打印 ====================
+void task2(void) {
+    uint32_t cnt = 0;
+    while (1) {
+        usart2_puts("Task2: Count = ");
+        char num_char = (cnt % 10) + '0';  // 计算个位数对应的 ASCII 字符
+        usart2_puts(&num_char);            // 传入字符的地址（注意！这里有隐患）
+        usart2_puts("\r\n");
+        cnt++;
+        delay(500000);
+        task_switch_trigger();   // 主动触发任务切换
+    }
+}
+
+// ==================== 中断向量表 ====================
+__attribute__((section(".isr_vector")))
+void (*const g_pfnVectors[])(void) = {
+    (void*)0x20005000,  // 0: 栈顶地址（MSP）
+    Reset_Handler,      // 1: 复位中断
+    0,                  // 2: NMI
+    0,                  // 3: 硬故障
+    0, 0, 0, 0, 0, 0, 0,0,0,0, // 保留中断
+    PendSV_Handler,     // 14: PendSV 中断（汇编实现）
+    0                   // 15: SysTick 中断
+};
+
+// ==================== 复位处理函数 ====================
+void Reset_Handler(void) {
+    // 1. 初始化 GPIOA PA5（LED）
+    RCC_APB2ENR |= (1 << 2);
+    GPIOA_CRL &= ~(0xF << 20);
+    GPIOA_CRL |= (0x03 << 20);  // PA5 推挽输出
+    GPIOA_ODR &= ~(1 << 5);     // LED 初始熄灭
+
+    // 2. 初始化串口
+    usart2_init();
+    usart2_puts("LED Off\r\n");
+    usart2_puts("=== Cortex-M3 PendSV MultiTask Demo ===\r\n");
+
+    // 3. 配置 PendSV 最低优先级
+    NVIC_SYSPRI2 |= (PENDSV_PRIORITY << 16);
+
+    // 4. 初始化任务栈
+    task_stack_init(0, task1);
+    task_stack_init(1, task2);
+    usart2_puts("Task Stack Init OK\r\n");
+
+    // 5. 启动第一个任务：手动模拟异常返回
+    uint32_t* first_sp = tcb[0].stack_ptr;
+    __asm volatile(
+        "mov sp, %0 \n"          // 切换到任务0栈
+        "pop {r4-r11} \n"        // 恢复软件上下文帧
+        "pop {r0-r3, r12, lr} \n"// 恢复异常栈帧低7个寄存器
+        "pop {pc} \n"            // 弹出 PC，跳转到 task1 入口
+        ::"r"(first_sp)
+        : "memory"
+    );
+
+    while (1); // 永远不会执行到这里
+}
+
+// ==================== 主函数（占位）====================
+int main(void) {
+    while (1);
+    return 0;
+}
